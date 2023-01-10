@@ -1,0 +1,665 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: 'This template deploys a VPC, with a pair of public and private subnets spread
+  across two Availability Zones. It deploys an internet gateway, with a default
+  route on the public subnets. It deploys a pair of NAT gateways (one in each AZ),
+  and default routes for them in the private subnets.
+  It deploys EKS control plane and worker node resources.
+  It deploys a PostgreSQL RDS instance'
+
+Mappings:
+  ServicePrincipalPartitionMap:
+    aws:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-cn:
+      EC2: ec2.amazonaws.com.cn
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-us-gov:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+
+Parameters:
+  EnvironmentName: 
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: thoughtMachine-dev
+
+  ClusterName: 
+    Description: Please enter a name for the Kubernetes cluster
+    Type: String
+    Default: thoughtMachine-cluster-dev
+
+  DBName:
+    Default: thoughtMachineDatabaseDev
+    Description: Please enter a name for the database
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric
+      characters.
+
+  DBUser:
+    Description: Please enter a database admin account username
+    Type: String
+    Default: MyUsername
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric
+      characters.
+
+  DBPassword:
+    NoEcho: 'true'
+    Description: Please enter a database admin account password
+    Type: String
+    Default: MyPassword
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]+'
+    ConstraintDescription: must contain only alphanumeric characters.
+
+  DBAllocatedStorage:
+    Default: '20'
+    Description: The size of the database (Gb)
+    Type: Number
+    MinValue: '20'
+    MaxValue: '6144'
+    ConstraintDescription: must be between 20 and 6144 Gb.
+
+  DBInstanceClass:
+    Description: The database instance type
+    Type: String
+    Default: db.t3.micro
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 192.168.0.0/24
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 192.168.0.0/26
+
+  PublicSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 192.168.0.64/26
+
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 192.168.0.128/26
+
+  PrivateSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 192.168.0.192/26
+
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ2)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ1)
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ2)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ1)
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ2)
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  NoIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "no-ingress-sg"
+      GroupDescription: "Security group with no ingress rule"
+      VpcId: !Ref VPC
+
+  ControlPlane:
+    Type: 'AWS::EKS::Cluster'
+    Properties:
+      KubernetesNetworkConfig:
+        IpFamily: ipv4
+      Name: !Ref ClusterName
+      ResourcesVpcConfig:
+        EndpointPrivateAccess: false
+        EndpointPublicAccess: true
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      RoleArn: !GetAtt 
+        - ServiceRole
+        - Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlane'
+      Version: '1.23'
+
+  LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    DependsOn: ControlPlane
+    Properties:
+      LaunchTemplateData:
+        KeyName: thoughtMachineSSH
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              Iops: 3000
+              Throughput: 125
+              VolumeSize: 80
+              VolumeType: gp3
+        MetadataOptions:
+          HttpPutResponseHopLimit: 2
+          HttpTokens: optional
+        SecurityGroupIds:
+          - !Ref ClusterSharedNodeSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ClusterName}-linux-nodes-Node
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: linux-nodes
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${ClusterName}-linux-nodes-Node
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: linux-nodes
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+          - ResourceType: network-interface
+            Tags:
+              - Key: Name
+                Value: !Sub ${ClusterName}-linux-nodes-Node
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: linux-nodes
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+      LaunchTemplateName: !Sub '${AWS::StackName}'
+
+  ManagedNodeGroup:
+    Type: 'AWS::EKS::Nodegroup'
+    DependsOn: ControlPlane
+    Properties:
+      AmiType: AL2_x86_64
+      ClusterName: !Ref ClusterName
+      InstanceTypes:
+        - t2.micro
+      Labels:
+        alpha.eksctl.io/cluster-name: !Ref ClusterName
+        alpha.eksctl.io/nodegroup-name: linux-nodes
+      LaunchTemplate:
+        Id: !Ref LaunchTemplate
+      NodeRole: !GetAtt 
+        - NodeInstanceRole
+        - Arn
+      NodegroupName: linux-nodes
+      ScalingConfig:
+        DesiredSize: 2
+        MaxSize: 2
+        MinSize: 2
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        alpha.eksctl.io/nodegroup-name: linux-nodes
+        alpha.eksctl.io/nodegroup-type: managed
+
+  NodeInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap 
+                  - ServicePrincipalPartitionMap
+                  - !Ref 'AWS::Partition'
+                  - EC2
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub >-
+          arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Path: /
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/NodeInstanceRole'
+
+  ControlPlaneSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Communication between the control plane and worker nodegroups
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlaneSecurityGroup'
+      VpcId: !Ref VPC
+
+  ClusterSharedNodeSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Communication between all nodes in the cluster
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ClusterSharedNodeSecurityGroup'
+      VpcId: !Ref VPC
+
+  IngressSSHNodeGroupSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow SSH connection from anywhere
+      GroupId: !Ref ClusterSharedNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
+  IngressDefaultClusterToNodeSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: ControlPlane
+    Properties:
+      Description: >-
+        Allow managed and unmanaged nodes to communicate with each other (all
+        ports)
+      FromPort: 0
+      GroupId: !Ref ClusterSharedNodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !GetAtt 
+        - ControlPlane
+        - ClusterSecurityGroupId
+      ToPort: 65535
+
+  IngressInterNodeGroupSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow nodes to communicate with each other (all ports)
+      FromPort: 0
+      GroupId: !Ref ClusterSharedNodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ClusterSharedNodeSecurityGroup
+      ToPort: 65535
+
+  IngressNodeToDefaultClusterSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: ControlPlane
+    Properties:
+      Description: Allow unmanaged nodes to communicate with control plane (all ports)
+      FromPort: 0
+      GroupId: !GetAtt 
+        - ControlPlane
+        - ClusterSecurityGroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ClusterSharedNodeSecurityGroup
+      ToPort: 65535
+
+  ServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap 
+                  - ServicePrincipalPartitionMap
+                  - !Ref 'AWS::Partition'
+                  - EKS
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSVPCResourceController'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ServiceRole'
+
+  PolicyCloudWatchMetrics:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'cloudwatch:PutMetricData'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-PolicyCloudWatchMetrics'
+      Roles:
+        - !Ref ServiceRole
+
+  PolicyELBPermissions:
+      Type: 'AWS::IAM::Policy'
+      Properties:
+        PolicyDocument:
+          Statement:
+            - Action:
+                - 'ec2:DescribeAccountAttributes'
+                - 'ec2:DescribeAddresses'
+                - 'ec2:DescribeInternetGateways'
+              Effect: Allow
+              Resource: '*'
+          Version: 2012-10-17
+        PolicyName: !Sub '${AWS::StackName}-PolicyELBPermissions'
+        Roles:
+          - !Ref ServiceRole
+
+  MasterDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref 'DBName'
+      AllocatedStorage: !Ref 'DBAllocatedStorage'
+      DBInstanceClass: !Ref 'DBInstanceClass'
+      Engine: postgres
+      MasterUsername: !Ref 'DBUser'
+      MasterUserPassword: !Ref 'DBPassword'
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroupName
+      VPCSecurityGroups: 
+      - !GetAtt DatabaseSecurityGroup.GroupId
+      Tags:
+      - Key: Name
+        Value: Master Database
+    DeletionPolicy: Snapshot
+
+  DBSubnetGroupName:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: Two private subnets grouped for RDS
+      SubnetIds: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: Database Subnet Group
+      
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL instance
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/DBSecurityGroup'
+      VpcId: !Ref VPC
+
+  IngressDatabaseSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow ec2 to connect to RDS
+      FromPort: 5432
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      SourceSecurityGroupId: !Ref ClusterSharedNodeSecurityGroup
+      ToPort: 5432
+
+  IngressDatabaseSSHSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow SSH from anywhere
+      FromPort: 22
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
+
+
+Outputs:
+  VPC:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+
+  SubnetsPrivate:
+    Value: !Join 
+      - ','
+      - - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPrivate'
+
+  SubnetsPublic:
+    Value: !Join 
+      - ','
+      - - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPublic'
+
+  PublicSubnet1:
+    Description: A reference to the public subnet in the 1st Availability Zone
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2:
+    Description: A reference to the public subnet in the 2nd Availability Zone
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnet1:
+    Description: A reference to the private subnet in the 1st Availability Zone
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2:
+    Description: A reference to the private subnet in the 2nd Availability Zone
+    Value: !Ref PrivateSubnet2
+
+  NoIngressSecurityGroup:
+    Description: Security group with no ingress rule
+    Value: !Ref NoIngressSecurityGroup
+
+  ARN:
+    Value: !GetAtt 
+      - ControlPlane
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ARN'
+
+  CertificateAuthorityData:
+    Value: !GetAtt 
+      - ControlPlane
+      - CertificateAuthorityData
+
+  ClusterSecurityGroupId:
+    Value: !GetAtt 
+      - ControlPlane
+      - ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}::ClusterSecurityGroupId'
+
+  ClusterStackName:
+    Value: !Ref 'AWS::StackName'
+
+  Endpoint:
+    Value: !GetAtt 
+      - ControlPlane
+      - Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}::Endpoint'
+
+  FeatureNATMode:
+    Value: Single
+
+  SecurityGroup:
+    Value: !Ref ControlPlaneSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}::SecurityGroup'
+
+  ServiceRoleARN:
+    Value: !GetAtt 
+      - ServiceRole
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ServiceRoleARN'
+
+  SharedNodeSecurityGroup:
+    Value: !Ref ClusterSharedNodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}::SharedNodeSecurityGroup'
